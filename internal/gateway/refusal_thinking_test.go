@@ -36,10 +36,11 @@ var anthropicThoughtThenAnswered = sse(`event: message_start`+"\n"+`data: {"type
 
 const claudeCodeAsk = `{"model":"group/g","max_tokens":10,"stream":true,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"hi"}]}`
 
-// A refusal after nothing but reasoning is one with nothing said: the
-// reasoning was shown to nobody, and the next member answers (#248) — for
-// Claude Code on Anthropic's API, Codex on Responses, and each protocol's
-// own reasoning.
+// A refusal after nothing but reasoning is one with nothing said: the next
+// member answers (#248) — for Claude Code on Anthropic's API, Codex on
+// Responses, and each protocol's own reasoning. The reasoning went to the
+// agent as it came (#4166), and the answer follows it in the same reply:
+// one start, the refusal nowhere.
 func TestRefusalAfterThinkingFailsOver(t *testing.T) {
 	chatThought := sse(`data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"thinking it over"}}]}`,
 		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}`,
@@ -58,12 +59,14 @@ func TestRefusalAfterThinkingFailsOver(t *testing.T) {
 		path  string
 		ask   string
 		model string // a model whose vendor refuses after thinking
+		// thought is the refused try's reasoning as the agent has it
+		thought string
 	}{
-		{"claude to claude code", func(t *testing.T, s *scripted) { scriptedOn(t, "a", provider.Anthropic, s) }, anthropicThoughtThenRefused, "/v1/messages", claudeCodeAsk, "claude-opus-5-5"},
-		{"claude to codex", func(t *testing.T, s *scripted) { scriptedOn(t, "a", provider.Anthropic, s) }, anthropicThoughtThenRefused, "/v1/responses", codexAsk, "claude-opus-5-5"},
-		{"chat to claude code", func(t *testing.T, s *scripted) { scriptedOn(t, "a", provider.Chat, s) }, chatThought, "/v1/messages", claudeCodeAsk, "gpt-5.2"},
-		{"responses to codex", func(t *testing.T, s *scripted) { responsesOn(t, "a", s) }, responsesThought, "/v1/responses", codexAsk, "gpt-5.2"},
-		{"responses to claude code", func(t *testing.T, s *scripted) { responsesOn(t, "a", s) }, responsesThought, "/v1/messages", claudeCodeAsk, "gpt-5.2"},
+		{"claude to claude code", func(t *testing.T, s *scripted) { scriptedOn(t, "a", provider.Anthropic, s) }, anthropicThoughtThenRefused, "/v1/messages", claudeCodeAsk, "claude-opus-5-5", "user wants"},
+		{"claude to codex", func(t *testing.T, s *scripted) { scriptedOn(t, "a", provider.Anthropic, s) }, anthropicThoughtThenRefused, "/v1/responses", codexAsk, "claude-opus-5-5", "user wants"},
+		{"chat to claude code", func(t *testing.T, s *scripted) { scriptedOn(t, "a", provider.Chat, s) }, chatThought, "/v1/messages", claudeCodeAsk, "gpt-5.2", "thinking it over"},
+		{"responses to codex", func(t *testing.T, s *scripted) { responsesOn(t, "a", s) }, responsesThought, "/v1/responses", codexAsk, "gpt-5.2", "Planning"},
+		{"responses to claude code", func(t *testing.T, s *scripted) { responsesOn(t, "a", s) }, responsesThought, "/v1/messages", claudeCodeAsk, "gpt-5.2", "Planning"},
 	} {
 		t.Run(x.name, func(t *testing.T) {
 			fresh(t)
@@ -82,8 +85,10 @@ func TestRefusalAfterThinkingFailsOver(t *testing.T) {
 			refusalGroup(t, "a/"+x.model, "b/m")
 			s := New()
 			code, body := sendTo(s, x.path, x.ask)
-			if code != 200 || !strings.Contains(body, "from b") || strings.Contains(body, `"refusal"`) || strings.Contains(body, "Planning") ||
-				strings.Contains(body, "thinking it over") || strings.Contains(body, "user wants") || a.n != 1 || b.n != 1 {
+			start := map[string]string{"/v1/messages": "event: message_start", "/v1/responses": "event: response.created"}[x.path]
+			thought, answer := strings.Index(body, x.thought), strings.Index(body, "from b")
+			if code != 200 || thought < 0 || answer < thought || strings.Contains(body, `"refusal"`) || strings.Contains(body, "bio_policy") ||
+				strings.Count(body, start) != 1 || a.n != 1 || b.n != 1 {
 				t.Fatalf("%d %s (a %d, b %d)", code, body, a.n, b.n)
 			}
 			r := lastRoute(s)
@@ -93,15 +98,27 @@ func TestRefusalAfterThinkingFailsOver(t *testing.T) {
 		})
 	}
 
-	// thinking that goes on to an answer comes through whole, as it came
-	fresh(t)
-	a := &scripted{replies: []reply{{200, "text/event-stream", anthropicThoughtThenAnswered}}}
-	b := &scripted{replies: []reply{{200, "text/event-stream", anthropicAnswer}}}
-	scriptedOn(t, "a", provider.Anthropic, a)
-	scriptedOn(t, "b", provider.Anthropic, b)
-	refusalGroup(t, "a/m", "b/m")
-	if code, body := sendTo(New(), "/v1/messages", claudeCodeAsk); code != 200 || body != anthropicThoughtThenAnswered || b.n != 0 {
-		t.Fatalf("answered: %d %s (b %d)", code, body, b.n)
+	// thinking that goes on to an answer comes through whole, as it came:
+	// a model whose vendor doesn't refuse after it, and Claude, whose
+	// reasoning goes as it comes while a refusal could still go on
+	for _, model := range []string{"m", "claude-opus-5-5"} {
+		fresh(t)
+		a := &scripted{replies: []reply{{200, "text/event-stream", anthropicThoughtThenAnswered}}}
+		b := &scripted{replies: []reply{{200, "text/event-stream", anthropicAnswer}}}
+		scriptedOn(t, "a", provider.Anthropic, a)
+		pa, err := provider.Find("a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pa.Models = []string{model}
+		if err := provider.Save(*pa); err != nil {
+			t.Fatal(err)
+		}
+		scriptedOn(t, "b", provider.Anthropic, b)
+		refusalGroup(t, "a/"+model, "b/m")
+		if code, body := sendTo(New(), "/v1/messages", claudeCodeAsk); code != 200 || body != anthropicThoughtThenAnswered || b.n != 0 {
+			t.Fatalf("answered %s: %d %s (b %d)", model, code, body, b.n)
+		}
 	}
 }
 

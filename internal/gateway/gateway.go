@@ -2580,6 +2580,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	if from == provider.Gemini {
 		streams = strings.Contains(r.URL.Path, "streamGenerateContent")
 	}
+	if streams && kept.follow == nil {
+		// a try's reasoning may go to the agent before the try is sure to
+		// answer, and the next try's stream then follows it (#4166)
+		kept.follow = newFollower(from)
+	}
 	gaveWay := map[string]bool{} // keys and accounts that gave way, full, to one free (laneMate)
 	// a group's members that failed in a way that passes are asked again,
 	// once each has been, for up to its Patience (#1418): a member of a
@@ -2658,7 +2663,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// for its allowance running out to be told as that one's error
 		// and once the agent has the stream's headers from an earlier try's
 		// keepalives, for a failure to be told as the stream's error
-		hw := newHoldWriter(w, !last || again < max(lastRetries, rateRetries) || other != nil || kept.sent || autoPicks(c) && repicked < 2 ||
+		hw := newHoldWriter(kept.follow.writer(w), !last || again < max(lastRetries, rateRetries) || other != nil || kept.sent || autoPicks(c) && repicked < 2 ||
 			patience > 0 && rounds < replanRounds && (waitFrom.IsZero() || time.Since(waitFrom) < patience) || wantWhole)
 		// a compaction's summary is held to its end, for a cut or an
 		// error halfway to go to the next candidate (#2274)
@@ -2674,6 +2679,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// not even response.created, for the whole of its thinking
 		// (LuckymanJC on Discord).
 		hw.thinkingShown = !refusesAfterThinking(c.model) || last
+		// While another could answer, it still goes as it comes, and only
+		// what ends the reply is held: a refusal or an error after the
+		// reasoning, nothing said, goes to the next candidate, whose
+		// stream follows what the agent has (#4166). Held whole, a group's
+		// Claude showed Claude Code its thinking only with its text, all
+		// at once, the first of it as late as the text.
+		hw.shows = streams && !hw.thinkingShown && !wantWhole && kept.follow != nil
 		hw.ctx, hw.alive, hw.streams = r.Context(), kept, streams
 		report := cacheReport
 		if c.p.Account == nil || c.p.Account.Agent != "claude" {
@@ -7633,7 +7645,9 @@ func failTo(w http.ResponseWriter, a *keptAlive, proto provider.Protocol, status
 	if a == nil || !a.sent {
 		return writeError(w, proto, status, msg)
 	}
-	streamError(w, proto, a.model, status, msg)
+	// the agent may have a try's reasoning already: the error goes on
+	// that reply, not as one of its own begun after it (follower)
+	streamError(a.follow.writer(w), proto, a.model, status, msg)
 	return status
 }
 

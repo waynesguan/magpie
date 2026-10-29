@@ -77,12 +77,12 @@ func ask(t *testing.T, s *Server, heard chan struct{}) (int, string) {
 }
 
 // Claude thinking for longer than the agent's idle timeout through a
-// group, where its stream is held for a refusal to go to another account
-// (#248): the agent heard nothing for up to four minutes, and Alma's 240s
-// timeout for a reasoning model ended the turn first (#751). It is kept
-// alive with comments meanwhile, which say nothing of the reasoning, and a
-// refusal after them still goes to the next member, whose answer follows
-// in the same stream.
+// group, where a refusal after it goes to another account (#248): held,
+// the agent heard nothing for up to four minutes, and Alma's 240s timeout
+// for a reasoning model ended the turn first (#751). Its reasoning goes to
+// the agent as it comes (#4166), comments between, and a refusal after it
+// still goes to the next member, whose answer follows it in the same
+// stream, as one reply.
 func TestHeldThinkingKeepsTheAgentAlive(t *testing.T) {
 	fresh(t)
 	keepFast(t, keepaliveGap, 20*time.Millisecond, keepaliveLongest)
@@ -97,8 +97,8 @@ func TestHeldThinkingKeepsTheAgentAlive(t *testing.T) {
 	refusalGroup(t, "a/claude-opus-5-5", "b/m")
 	s := New()
 	code, body := ask(t, s, heard)
-	alive := strings.Index(body, ": keepalive")
-	if code != 200 || alive < 0 || !strings.Contains(body[alive:], "from b") || strings.Contains(body, "user wants") || strings.Contains(body, `"refusal"`) || b.n != 1 {
+	thought, answer := strings.Index(body, "user wants"), strings.Index(body, "from b")
+	if code != 200 || thought < 0 || answer < thought || strings.Contains(body, `"refusal"`) || b.n != 1 {
 		t.Fatalf("%d %q (b %d)", code, body, b.n)
 	}
 	if strings.Count(body, "event: message_start") != 1 {
@@ -109,15 +109,15 @@ func TestHeldThinkingKeepsTheAgentAlive(t *testing.T) {
 		t.Fatalf("tries: %+v", r.Tries)
 	}
 
-	// thinking that goes on to its answer comes through whole after them
+	// thinking that goes on to its answer comes through whole, as it came
 	fresh(t)
 	heard = make(chan struct{})
 	thinkingOn(t, "a", anthropicThoughtThenAnswered, heard)
 	scriptedOn(t, "b", provider.Anthropic, &scripted{replies: []reply{{200, "text/event-stream", anthropicAnswer}}})
 	refusalGroup(t, "a/claude-opus-5-5", "b/m")
 	code, body = ask(t, New(), heard)
-	alive = strings.Index(body, ": keepalive")
-	if code != 200 || alive < 0 || !strings.Contains(body[alive:], `"thinking":"hm"`) || !strings.Contains(body, "from a") || strings.Contains(body, "from b") {
+	thought, answer = strings.Index(body, `"thinking":"hm"`), strings.Index(body, "from a")
+	if code != 200 || thought < 0 || answer < thought || strings.Contains(body, "from b") || strings.Count(body, "event: message_start") != 1 {
 		t.Fatalf("answered: %d %q", code, body)
 	}
 

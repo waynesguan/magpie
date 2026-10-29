@@ -30,6 +30,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tidwall/gjson"
+
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -1848,6 +1850,22 @@ type holdWriter struct {
 	// (thinkingShown) while the request could still have asked again, so
 	// an empty reply is asked again in place as often (emptyRetries)
 	thoughtThrough bool
+	// shows: the model's vendor may refuse after reasoning, and another
+	// candidate could answer that, but its reasoning still goes to the
+	// agent as it comes (#4166): what ends the reply, or begins anything
+	// but reasoning, is held until it says something, and a refusal or an
+	// error before it does goes to the next candidate, whose stream
+	// follows the reasoning the agent has (follower). Held whole, a
+	// group's Claude showed Claude Code its thinking only with its text,
+	// all at once, and never its "thinking with <effort> effort".
+	shows bool
+	// shown: some of the try has gone to the agent that way (through);
+	// framed: something else framed its reply before any reasoning, and
+	// it is held as before; ending: what ends it, or something else, has
+	// come since, and is held with what follows; thinks, its thinking
+	// blocks (Anthropic), by index
+	shown, framed, ending bool
+	thinks                map[int64]bool
 
 	ended bool   // the stream's last event was written: the reply is whole
 	tail  []byte // the end of the last write, for a marker split across two
@@ -2255,7 +2273,11 @@ func (h *holdWriter) scan() {
 			break
 		}
 		h.scanned += end
-		switch kind, status, msg := streamEvent(rest[:end]); kind {
+		kind, status, msg := streamEvent(rest[:end])
+		if h.shows && h.showing(rest[:end], kind) {
+			continue
+		}
+		switch kind {
 		case eventLead:
 			continue
 		case eventBuffering:
@@ -2292,7 +2314,10 @@ func (h *holdWriter) scan() {
 		h.flow()
 		return
 	}
-	if h.wantWhole {
+	if h.wantWhole || h.shown {
+		// a try showing its reasoning is held only for what ends it,
+		// which comes last: the agent has its events meanwhile, so
+		// nothing is let through for time
 		return
 	}
 	if h.alive.tooQuiet(0) {
@@ -2331,6 +2356,150 @@ func (h *holdWriter) scan() {
 	}
 }
 
+// showing deals with an event of a try whose reasoning goes to the agent
+// as it comes (shows), and says whether it did: the reasoning, and what
+// frames it or the reply's start, go now (through); what ends the reply,
+// or begins anything but reasoning, is held with what follows it (ending)
+// until the reply says something or fails. An error, a refusal, what says
+// something, and what comes before any reasoning are left to scan, as
+// they were.
+func (h *holdWriter) showing(ev []byte, kind int) bool {
+	switch kind {
+	case eventLead, eventThinking:
+		if h.ending {
+			return true
+		}
+		if h.reasoningFrame(ev) {
+			if h.shown || kind == eventThinking && !h.framed {
+				h.through(h.scanned)
+				return true
+			}
+			return false
+		}
+		if h.shown {
+			h.ending = true
+			return true
+		}
+		h.framed = true
+		return false
+	case eventContent:
+		if h.shown && onlyEnds(ev) {
+			h.ending = true
+			return true
+		}
+	}
+	return false
+}
+
+// through sends the agent the first n bytes held of a try that shows its
+// reasoning, its status and headers first: the try stays held for the
+// rest, which may still fail for the next candidate to answer, and what
+// the agent has is read from here on, for that candidate's stream to
+// follow it (follower).
+func (h *holdWriter) through(n int) {
+	if n <= 0 {
+		return
+	}
+	if !h.shown {
+		h.shown = true
+		if h.alive != nil && h.alive.follow != nil {
+			h.alive.follow.on = true
+		}
+	}
+	h.head(true)
+	b := h.held.Bytes()[:n]
+	h.sent(b)
+	h.w.Write(b)
+	h.held.Next(n)
+	h.scanned -= n
+	if f, ok := h.w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// reasoningFrame tells whether an event of a try that shows its reasoning
+// goes to the agent as it comes: the reasoning itself (a thinking block's
+// start, deltas and stop, a reasoning item's events), the reply's start,
+// a ping, a comment, or a Chat or Gemini chunk, deltas the agent adds up.
+// Anything else is held: a text block begun, even empty, the agent would
+// keep and hand back, and Anthropic turns an empty one away.
+func (h *holdWriter) reasoningFrame(ev []byte) bool {
+	name, data := sseParts(ev)
+	if len(data) == 0 {
+		return name == "" // a comment
+	}
+	typ := gjson.GetBytes(data, "type").String()
+	if typ == "" {
+		typ = name
+	}
+	switch typ {
+	case "message_start", "ping", "response.created", "response.in_progress", "response.queued", "response.metadata":
+		return true
+	case "content_block_start":
+		if t := gjson.GetBytes(data, "content_block.type").String(); t != "thinking" && t != "redacted_thinking" {
+			return false
+		}
+		if h.thinks == nil {
+			h.thinks = map[int64]bool{}
+		}
+		h.thinks[gjson.GetBytes(data, "index").Int()] = true
+		return true
+	case "content_block_delta", "content_block_stop":
+		return h.thinks[gjson.GetBytes(data, "index").Int()]
+	case "response.output_item.added", "response.output_item.done":
+		return gjson.GetBytes(data, "item.type").String() == "reasoning"
+	case "":
+		// a Chat or Gemini chunk, which streamEvent read as one that says
+		// nothing or only reasons; a [DONE] isn't
+		return !bytes.Equal(data, []byte("[DONE]"))
+	}
+	return strings.HasPrefix(typ, "response.reasoning_") || strings.HasPrefix(typ, "codex.")
+}
+
+// onlyEnds tells whether an event only ends a reply: Anthropic's
+// message_delta and message_stop, Responses' completed, incomplete or
+// done, a Chat chunk with nothing in its delta but its finish_reason, or
+// its [DONE], and a Gemini chunk with a finishReason and no part.
+func onlyEnds(ev []byte) bool {
+	name, data := sseParts(ev)
+	if bytes.Equal(data, []byte("[DONE]")) {
+		return true
+	}
+	typ := gjson.GetBytes(data, "type").String()
+	if typ == "" {
+		typ = name
+	}
+	switch typ {
+	case "message_delta", "message_stop", "response.completed", "response.incomplete", "response.done":
+		return true
+	case "":
+	default:
+		return false
+	}
+	ends := false
+	if choices := gjson.GetBytes(data, "choices"); choices.IsArray() {
+		for _, c := range choices.Array() {
+			said := false
+			c.Get("delta").ForEach(func(k, v gjson.Result) bool {
+				said = k.String() != "role" && v.Type != gjson.Null && v.String() != ""
+				return !said
+			})
+			if said {
+				return false
+			}
+			ends = ends || c.Get("finish_reason").Type == gjson.String
+		}
+		return ends
+	}
+	for _, c := range gjson.GetBytes(data, "candidates").Array() {
+		if len(c.Get("content.parts").Array()) > 0 {
+			return false
+		}
+		ends = ends || c.Get("finishReason").String() != ""
+	}
+	return ends
+}
+
 // keepHeldAfter is how long a held stream waits before its agent is first
 // kept alive (keepAlive): the stream's 200, then a comment every
 // keepHeldEvery. A refusal after it still goes to another account, whose
@@ -2356,8 +2525,12 @@ type keptAlive struct {
 	// model is the one the agent asked for, which an error sent in the
 	// stream names (streamError, #3728)
 	model string
-	sent  bool      // the stream's 200 and headers went out
-	at    time.Time // the last comment
+	// follow is what the agent has of the reply, once a try's reasoning
+	// went to it, for the next try's stream to follow (#4166); nil for a
+	// request that isn't streamed
+	follow *follower
+	sent   bool      // the stream's 200 and headers went out
+	at     time.Time // the last comment
 	// told is when the agent was last sent anything of a reply, else when
 	// it asked; streams, whether it asked for a stream
 	told    time.Time
@@ -2397,32 +2570,8 @@ func (h *holdWriter) keepAlive() {
 	if a == nil || a.proto == provider.Gemini || time.Since(a.at) < min(keepaliveEvery, keepHeldEvery) {
 		return
 	}
-	if !a.sent {
-		if !a.cacheReportUntil.IsZero() {
-			if time.Now().Before(a.cacheReportUntil) {
-				return
-			}
-			a.cacheReportUntil = time.Time{}
-			h.header.Del("X-Magpie-Cache-Marks-Dropped")
-			h.notes.Del("X-Magpie-Cache-Marks-Dropped")
-			log.Printf("claude: cache-mark report timed out before run selection; streaming without the dropped-mark header")
-		}
-		// the try's header is whole once it has its status (WriteHeader,
-		// under mu); before, the vendor's are still being copied into it
-		// from the try's goroutine, and only magpie's notes are read
-		src := h.header
-		if h.status == 0 {
-			src = h.notes
-		}
-		dst := h.w.Header()
-		for k, v := range src {
-			if k != resetsHeader && k != refusedHeader && k != zdrHeader && k != answeredThereHeader && k != keyLimitThereHeader && k != "Content-Length" {
-				dst[k] = slices.Clone(v)
-			}
-		}
-		dst.Set("Content-Type", "text/event-stream; charset=utf-8")
-		h.w.WriteHeader(http.StatusOK)
-		a.sent = true
+	if !h.head(false) {
+		return
 	}
 	// no blank line after it, as sseWriter.comment
 	_, _ = io.WriteString(h.w, ": keepalive\n")
@@ -2431,6 +2580,44 @@ func (h *holdWriter) keepAlive() {
 	if f, ok := h.w.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// head sends the agent the stream's status and headers ahead of anything
+// of the try, once for the request (keptAlive.sent), and says whether
+// they have gone. Cache-mark reporting may hold them back a little
+// (cacheReportUntil), unless force: a try showing its reasoning sends
+// them with its first.
+func (h *holdWriter) head(force bool) bool {
+	a := h.alive
+	if a == nil || a.sent {
+		return a != nil
+	}
+	if !a.cacheReportUntil.IsZero() {
+		if !force && time.Now().Before(a.cacheReportUntil) {
+			return false
+		}
+		a.cacheReportUntil = time.Time{}
+		h.header.Del("X-Magpie-Cache-Marks-Dropped")
+		h.notes.Del("X-Magpie-Cache-Marks-Dropped")
+		log.Printf("claude: cache-mark report timed out before run selection; streaming without the dropped-mark header")
+	}
+	// the try's header is whole once it has its status (WriteHeader,
+	// under mu); before, the vendor's are still being copied into it
+	// from the try's goroutine, and only magpie's notes are read
+	src := h.header
+	if h.status == 0 {
+		src = h.notes
+	}
+	dst := h.w.Header()
+	for k, v := range src {
+		if k != resetsHeader && k != refusedHeader && k != zdrHeader && k != answeredThereHeader && k != keyLimitThereHeader && k != "Content-Length" {
+			dst[k] = slices.Clone(v)
+		}
+	}
+	dst.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.w.WriteHeader(http.StatusOK)
+	a.sent = true
+	return true
 }
 
 // sent notes b going to the agent.
